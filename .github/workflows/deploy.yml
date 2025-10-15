@@ -1,0 +1,445 @@
+
+name: Databricks Git Sync CI/CD
+
+on:
+  push:
+    branches: [ sandbox, main ]
+  pull_request:
+    branches: [ sandbox, main ]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: 'Force sync production workspace'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read
+  security-events: write  # Required for CodeQL
+
+env:
+  # Databricks workspace configuration
+  DEV_DATABRICKS_HOST: ${{ secrets.DEV_DATABRICKS_HOST }}
+  DEV_DATABRICKS_TOKEN: ${{ secrets.DEV_DATABRICKS_TOKEN }}
+  PROD_DATABRICKS_HOST: ${{ secrets.PROD_DATABRICKS_HOST }}
+  PROD_DATABRICKS_TOKEN: ${{ secrets.PROD_DATABRICKS_TOKEN }}
+  
+  # AWS Configuration for SNS
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: 263789222982
+  SNS_TOPIC_ARN: arn:aws:sns:us-east-1:263789222982:Databricks-Github-pipeline
+  AWS_ROLE_ARN: arn:aws:iam::263789222982:role/Databricks-Github-pipeline-sns
+
+jobs:
+  code-security:
+    name: 🛡️ CodeQL
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    outputs:
+      codeql_status: ${{ steps.check-security.outputs.status }}
+      codeql_message: ${{ steps.check-security.outputs.message }}
+      security_issues: ${{ steps.check-security.outputs.issues }}
+      issue_count: ${{ steps.check-security.outputs.issue_count }}
+      issue_details: ${{ steps.check-security.outputs.issue_details }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-and-quality
+          build-mode: none
+
+      - name: Analyze
+        id: analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "language:python"
+          upload: true
+        continue-on-error: true
+
+      # Replaced fixed sleep + single call with polling + multiple ref strategies
+      - name: Poll Code Scanning Alerts (GitHub API)
+        id: check-security
+        shell: bash
+        run: |
+          echo "Polling GitHub Code Scanning alerts..."
+          PR_NUMBER='${{ github.event.pull_request.number }}'
+          MERGE_REF="refs/pull/${PR_NUMBER}/merge"
+          HEAD_REF="refs/pull/${PR_NUMBER}/head"
+          BRANCH_NAME='${{ github.event.pull_request.head.ref }}'
+          BRANCH_FULL="refs/heads/${BRANCH_NAME}"
+          COMMIT_SHA='${{ github.event.pull_request.head.sha }}'
+
+          echo "Refs to try:"
+          printf '%s\n' "$MERGE_REF" "$HEAD_REF" "$BRANCH_FULL" "$COMMIT_SHA"
+
+          STATUS="success"
+          MESSAGE="✅ CodeQL Analysis PASSED - No security issues found in code"
+          SECURITY_ISSUES="false"
+          ISSUE_COUNT=0
+          ISSUE_DETAILS=""
+
+          attempt=1
+          max_attempts=10
+          sleep_seconds=15
+
+          # Need jq
+          if ! command -v jq >/dev/null; then
+            sudo apt-get update -y && sudo apt-get install -y jq
+          fi
+
+          # Function to query alerts for a single ref (or commit SHA)
+          fetch_alerts () {
+            local ref="$1"
+            local url="https://api.github.com/repos/${{ github.repository }}/code-scanning/alerts?state=open&per_page=100&ref=${ref}"
+            curl -s -H "Authorization: Bearer ${{ github.token }}" \
+                 -H "Accept: application/vnd.github+json" \
+                 "$url"
+          }
+
+          # Candidate refs list
+          CANDIDATES=("$MERGE_REF" "$HEAD_REF" "$BRANCH_FULL" "$COMMIT_SHA")
+
+          while [ $attempt -le $max_attempts ]; do
+            echo "Attempt $attempt/$max_attempts..."
+            ALL_ALERTS_JSON="[]"
+
+            for ref in "${CANDIDATES[@]}"; do
+              echo " Querying ref: $ref"
+              RESP=$(fetch_alerts "$ref")
+              # If API returns array, merge
+              if echo "$RESP" | jq -e 'type=="array"' >/dev/null 2>&1; then
+                COUNT=$(echo "$RESP" | jq 'length')
+                echo "  -> $COUNT open alert(s) on $ref"
+                # Merge arrays - simplified approach
+                ALL_ALERTS_JSON=$(echo "$ALL_ALERTS_JSON" "$RESP" | jq -s 'add | unique_by(.rule.id)')
+              else
+                echo "  -> Non-array response (possibly empty or error)"
+                echo "Response: $RESP" | head -3
+              fi
+            done
+
+            ISSUE_COUNT=$(echo "$ALL_ALERTS_JSON" | jq 'length')
+            echo "Aggregated distinct alerts: $ISSUE_COUNT"
+
+            if [ "$ISSUE_COUNT" -gt 0 ]; then
+              SECURITY_ISSUES="true"
+              STATUS="failed"
+              if [ "$ISSUE_COUNT" -eq 1 ]; then
+                MESSAGE="🚨 CodeQL detected 1 security issue!"
+              else
+                MESSAGE="🚨 CodeQL detected $ISSUE_COUNT security issues!"
+              fi
+
+              ISSUE_DETAILS=$(echo "$ALL_ALERTS_JSON" | jq -r \
+                '.[] | "• " + (.rule.id // "unknown") + ": " + (.rule.description // "No description") + " (Severity: " + (.rule.severity // "n/a") + ")"' \
+                | head -10)
+
+              MESSAGE="$MESSAGE
+
+              Security Issues (top 10):
+              $ISSUE_DETAILS
+
+              🔗 Full details: ${{ github.server_url }}/${{ github.repository }}/security/code-scanning"
+              break
+            fi
+
+            # If no alerts yet, wait & retry
+            if [ $attempt -lt $max_attempts ]; then
+              echo "No alerts yet. Sleeping $sleep_seconds s..."
+              sleep $sleep_seconds
+            fi
+            attempt=$((attempt+1))
+          done
+
+          # If analyze step itself failed but no alerts (edge)
+          if [[ "${{ steps.analyze.outcome }}" == "failure" && "$SECURITY_ISSUES" == "false" ]]; then
+            STATUS="failed"
+            MESSAGE="🚨 CodeQL analysis failed (tool error) – manual review needed."
+          fi
+
+          echo "Final: STATUS=$STATUS, ISSUE_COUNT=$ISSUE_COUNT"
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "issues=$SECURITY_ISSUES" >> $GITHUB_OUTPUT
+          echo "issue_count=$ISSUE_COUNT" >> $GITHUB_OUTPUT
+          echo "message<<EOF" >> $GITHUB_OUTPUT
+          echo "$MESSAGE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "issue_details<<EOF" >> $GITHUB_OUTPUT
+          echo "$ISSUE_DETAILS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+  validate-secrets:
+    name: 🔐 Validate Databricks Secrets
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      dev_secrets_available: ${{ steps.check-dev.outputs.available }}
+      prod_secrets_available: ${{ steps.check-prod.outputs.available }}
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Verify AWS identity
+        run: |
+          echo "AWS Identity:"
+          aws sts get-caller-identity
+      
+      - name: Check Development secrets
+        id: check-dev
+        run: |
+          if [ -z "${{ env.DEV_DATABRICKS_HOST }}" ] || [ -z "${{ env.DEV_DATABRICKS_TOKEN }}" ]; then
+            echo "::error::Development Databricks secrets missing"
+            echo "available=false" >> $GITHUB_OUTPUT
+          else
+            echo "Development secrets OK"
+            echo "available=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Check Production secrets
+        id: check-prod
+        run: |
+          if [ -z "${{ env.PROD_DATABRICKS_HOST }}" ] || [ -z "${{ env.PROD_DATABRICKS_TOKEN }}" ]; then
+            echo "::error::Production Databricks secrets missing"
+            echo "available=false" >> $GITHUB_OUTPUT
+          else
+            echo "Production secrets OK"
+            echo "available=true" >> $GITHUB_OUTPUT
+          fi
+
+  notify-deployment:
+    name: 📢 Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [validate-secrets, code-security]
+    if: always() && ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') || github.event_name == 'pull_request')
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-Notify-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Prepare deployment summary
+        id: summary
+        run: |
+          OVERALL_STATUS="✅ SUCCESS"
+          STATUS_EMOJI="🎉"
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            if [[ "${{ needs.code-security.outputs.codeql_status }}" == "failed" ]] || \
+               [[ "${{ needs.code-security.outputs.security_issues }}" == "true" ]] || \
+               [[ "${{ needs.code-security.outputs.issue_count }}" != "0" ]]; then
+              OVERALL_STATUS="❌ SECURITY ISSUES DETECTED"
+              STATUS_EMOJI="🚨"
+            fi
+          else
+            if [[ "${{ needs.validate-secrets.result }}" == "failure" ]]; then
+              OVERALL_STATUS="❌ FAILED"
+              STATUS_EMOJI="🚨"
+            fi
+          fi
+
+          # Get current timestamp
+          TIMESTAMP=$(date '+%m/%d/%Y, %I:%M:%S %p')
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # Format CodeQL Security Report
+            MESSAGE="Dear Team,
+
+            The CodeQL Security Analysis has been completed for Pull Request #${{ github.event.pull_request.number }}.
+
+            ═══════════════════════════════════════════════════════════════
+                                      SECURITY ANALYSIS SUMMARY
+            ═══════════════════════════════════════════════════════════════
+
+            Analysis Result:       $OVERALL_STATUS
+            Repository:           ${{ github.repository }}
+            Pull Request:         #${{ github.event.pull_request.number }}
+            Branch:               ${{ github.event.pull_request.head.ref }}
+            Commit SHA:           ${{ github.event.pull_request.head.sha }}
+            Triggered By:         ${{ github.actor }}
+            Completed:            $TIMESTAMP
+
+            ═══════════════════════════════════════════════════════════════
+                                      CODEQL FINDINGS
+            ═══════════════════════════════════════════════════════════════
+
+            Security Issues Found: ${{ needs.code-security.outputs.issue_count }}
+            Analysis Status:       ${{ needs.code-security.outputs.codeql_status }}
+
+            ${{ needs.code-security.outputs.codeql_message }}"
+
+                        # Add issue details if any exist
+                        if [[ "${{ needs.code-security.outputs.issue_details }}" != "" ]]; then
+                          MESSAGE="$MESSAGE
+
+            ═══════════════════════════════════════════════════════════════
+                                      SECURITY ISSUE DETAILS
+            ═══════════════════════════════════════════════════════════════
+
+            ${{ needs.code-security.outputs.issue_details }}"
+                        fi
+
+                        MESSAGE="$MESSAGE
+
+            ═══════════════════════════════════════════════════════════════
+                                      ACTIONS REQUIRED
+            ═══════════════════════════════════════════════════════════════"
+
+                        if [[ "${{ needs.code-security.outputs.issue_count }}" != "0" ]]; then
+                          MESSAGE="$MESSAGE
+
+            ⚠️  IMMEDIATE ACTION REQUIRED:
+              • Review security findings in the GitHub Security tab
+              • Address all high and critical severity issues
+              • Update code to resolve security vulnerabilities
+              • Request re-review after fixes are applied
+
+            🔗 View Full Security Report: ${{ github.server_url }}/${{ github.repository }}/security/code-scanning
+            🔗 Pull Request: ${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+            🔗 Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                        else
+                          MESSAGE="$MESSAGE
+
+            ✅ NO ACTION REQUIRED:
+              • All security checks passed successfully
+              • No security vulnerabilities detected
+              • Pull request is ready for code review
+
+            🔗 Pull Request: ${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+            🔗 Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                        fi
+
+                      else
+                        # Format Databricks Deployment Report
+                        MESSAGE="Dear Team,
+
+            The Databricks Deployment Process has been completed.
+
+            ═══════════════════════════════════════════════════════════════
+                                      DEPLOYMENT SUMMARY
+            ═══════════════════════════════════════════════════════════════
+
+            Deployment Result:    $OVERALL_STATUS
+            Repository:           ${{ github.repository }}
+            Branch:               ${{ github.ref_name }}
+            Commit SHA:           ${{ github.sha }}
+            Triggered By:         ${{ github.actor }}
+            Environment:          Production
+            Completed:            $TIMESTAMP
+
+            ═══════════════════════════════════════════════════════════════
+                                      VALIDATION RESULTS
+            ═══════════════════════════════════════════════════════════════
+
+            Secrets Validation:   ${{ needs.validate-secrets.result }}
+            Dev Environment:      ${{ needs.validate-secrets.outputs.dev_secrets_available }}
+            Prod Environment:     ${{ needs.validate-secrets.outputs.prod_secrets_available }}"
+
+                        MESSAGE="$MESSAGE
+
+            ═══════════════════════════════════════════════════════════════
+                                      ACTIONS REQUIRED
+            ═══════════════════════════════════════════════════════════════"
+
+                        if [[ "${{ needs.validate-secrets.result }}" == "failure" ]]; then
+                          MESSAGE="$MESSAGE
+
+            ⚠️  IMMEDIATE ACTION REQUIRED:
+              • Check Databricks workspace connections
+              • Verify secret configurations in GitHub
+              • Contact DevOps team if issues persist
+              • Monitor deployment status closely
+
+            🔗 Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            🔗 Repository: ${{ github.server_url }}/${{ github.repository }}"
+                        else
+                          MESSAGE="$MESSAGE
+
+            ✅ NO ACTION REQUIRED:
+              • All validations completed successfully
+              • Databricks environments are accessible
+              • Deployment pipeline is healthy
+
+            🔗 Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            🔗 Repository: ${{ github.server_url }}/${{ github.repository }}"
+                        fi
+                      fi
+
+                      MESSAGE="$MESSAGE
+
+
+            ═══════════════════════════════════════════════════════════════
+                                      SUPPORT INFORMATION
+            ═══════════════════════════════════════════════════════════════
+
+            For questions or issues, please contact:
+            • DevOps Team: devops@company.com
+            • Security Team: security@company.com
+            • GitHub Repository: ${{ github.repository }}
+
+            This is an automated notification from GitHub Actions.
+            Do not reply to this message."
+
+          echo "status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
+          echo "message<<EOF" >> $GITHUB_OUTPUT
+          echo "$MESSAGE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      
+      - name: Send SNS notification
+        run: |
+          # Determine subject based on event type and status
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            if [[ "${{ needs.code-security.outputs.issue_count }}" != "0" ]]; then
+              SUBJECT="🚨 Security Issues Detected - CodeQL Analysis Complete - ${{ github.repository }}"
+            else
+              SUBJECT="✅ Security Analysis Complete - No Issues Found - ${{ github.repository }}"
+            fi
+          else
+            if [[ "${{ needs.validate-secrets.result }}" == "failure" ]]; then
+              SUBJECT="❌ Databricks Deployment Failed - Action Required - ${{ github.repository }}"
+            else
+              SUBJECT="✅ Databricks Deployment Complete - No Action Required - ${{ github.repository }}"
+            fi
+          fi
+          
+          aws sns publish \
+            --topic-arn "${{ env.SNS_TOPIC_ARN }}" \
+            --subject "$SUBJECT" \
+            --message "${{ steps.summary.outputs.message }}"
+
+      - name: Summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "| CodeQL Security | ${{ needs.code-security.result }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Security Issues | ${{ needs.code-security.outputs.issue_count }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Security Status | ${{ needs.code-security.outputs.codeql_status }} |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🔍 **CodeQL Result**: ${{ needs.code-security.outputs.codeql_message }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Secrets | ${{ needs.validate-secrets.result }} |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📧 SNS notification sent to: \`${{ env.SNS_TOPIC_ARN }}\`" >> $GITHUB_STEP_SUMMARY
+
